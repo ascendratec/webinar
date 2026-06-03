@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EventHub - Eventos</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <script src="app.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+</head>
+<body>
+  <main class="container" x-data="eventsPage">
+    <!-- Notification bar -->
+    <div x-show="$store.notification.message" x-cloak
+         :style="{ padding: '1rem', marginBottom: '1rem', borderRadius: '4px', backgroundColor: $store.notification.type === 'error' ? 'rgba(217, 83, 79, 0.9)' : 'rgba(92, 184, 92, 0.9)', color: '#fff', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }">
+      <span x-text="$store.notification.message"></span>
+      <button @click="$store.notification.dismiss()" style="margin: 0; padding: 0.25rem 0.5rem; width: auto; color: #fff; background: transparent; border: 1px solid rgba(255,255,255,0.5);">&times;</button>
+    </div>
+
+    <!-- Event List Section -->
+    <section x-show="!selectedEvent">
+      <h1>Eventos</h1>
+
+      <p x-show="loading" aria-busy="true">Loading events...</p>
+
+      <article x-show="error && !selectedEvent">
+        <p x-text="error"></p>
+        <button @click="fetchEvents()">Retry</button>
+      </article>
+
+      <p x-show="!loading && !error && events.length === 0">No events available</p>
+
+      <template x-for="event in events" :key="event.eventId">
+        <article @click="viewEvent(event.eventId)" style="cursor: pointer;">
+          <header>
+            <strong x-text="event.title"></strong>
+            <span x-show="event.availableSlots === 0"
+                  style="background-color: #d9534f; color: white; padding: 0.2rem 0.5rem; border-radius: 4px; font-size: 0.8rem; margin-left: 0.5rem;">
+              Full
+            </span>
+          </header>
+          <p>
+            <small x-text="new Date(event.date).toLocaleDateString()"></small> &mdash;
+            <span x-text="event.location"></span>
+          </p>
+          <footer>
+            <span x-text="event.availableSlots + ' slots available'"></span>
+          </footer>
+        </article>
+      </template>
+    </section>
+
+    <!-- Event Detail Section -->
+    <section x-show="selectedEvent && !showRegisterForm && !registrationResult">
+      <template x-if="selectedEvent">
+        <article>
+          <header>
+            <h2 x-text="selectedEvent.title"></h2>
+          </header>
+          <p x-text="selectedEvent.description"></p>
+          <dl>
+            <dt>Date</dt>
+            <dd x-text="new Date(selectedEvent.date).toLocaleDateString()"></dd>
+            <dt>Location</dt>
+            <dd x-text="selectedEvent.location"></dd>
+            <dt>Capacity</dt>
+            <dd x-text="selectedEvent.capacity"></dd>
+            <dt>Available Slots</dt>
+            <dd x-text="selectedEvent.availableSlots"></dd>
+          </dl>
+          <footer>
+            <button @click="backToList()" class="secondary">Back</button>
+            <button
+              :disabled="selectedEvent.availableSlots === 0"
+              @click="openRegisterForm()"
+              x-text="selectedEvent.availableSlots === 0 ? 'Full' : 'Register'">
+            </button>
+          </footer>
+        </article>
+      </template>
+    </section>
+
+    <!-- Registration Form Section -->
+    <section x-show="showRegisterForm && !registrationResult">
+      <article>
+        <header>
+          <h2>Register for <span x-text="selectedEvent?.title"></span></h2>
+        </header>
+        <form @submit.prevent="submitRegistration()">
+          <label for="reg-name">
+            Name
+            <input type="text" id="reg-name" x-model="registration.name" placeholder="Your full name" required>
+          </label>
+          <small x-show="formErrors.name" style="color: #d9534f;" x-text="formErrors.name"></small>
+
+          <label for="reg-email">
+            Email
+            <input type="email" id="reg-email" x-model="registration.email" placeholder="your@email.com" required>
+          </label>
+          <small x-show="formErrors.email" style="color: #d9534f;" x-text="formErrors.email"></small>
+
+          <footer>
+            <button type="button" class="secondary" @click="showRegisterForm = false">Back</button>
+            <button type="submit" :disabled="submitting" :aria-busy="submitting" x-text="submitting ? 'Submitting...' : 'Submit Registration'"></button>
+          </footer>
+        </form>
+      </article>
+    </section>
+
+    <!-- Registration Result Section -->
+    <section x-show="registrationResult">
+      <article>
+        <header>
+          <h2>Registration Successful</h2>
+        </header>
+        <p>Your registration ID:</p>
+        <p><strong x-text="registrationResult?.id"></strong></p>
+        <p><small>Bookmark this page to return later — your registration ID is saved in the URL.</small></p>
+        <p>Status:
+          <span
+            :style="{
+              color: 'white',
+              padding: '0.2rem 0.5rem',
+              borderRadius: '4px',
+              fontSize: '0.85rem',
+              backgroundColor: registrationResult?.status === 'PENDING_DOCUMENT' ? '#f0ad4e' :
+                               registrationResult?.status === 'DOCUMENT_UPLOADED' ? '#5bc0de' :
+                               registrationResult?.status === 'APPROVED' ? '#5cb85c' :
+                               registrationResult?.status === 'REJECTED' ? '#d9534f' : '#6c757d'
+            }"
+            x-text="registrationResult?.status">
+          </span>
+        </p>
+
+        <!-- Upload Widget (Registration Result) -->
+        <div x-show="registrationResult?.status === 'PENDING_DOCUMENT' && !uploadSuccess" style="margin-top: 1rem;">
+          <h3>Upload Document</h3>
+          <label for="upload-file-reg">
+            Select file (PDF, PNG, or JPEG, max 5 MB)
+            <input type="file" id="upload-file-reg" accept=".pdf,.png,.jpg,.jpeg" @change="selectFile($event)" :disabled="uploading">
+          </label>
+          <small x-show="uploadError" style="color: #d9534f;" x-text="uploadError"></small>
+          <button x-show="uploadFile && !uploading" @click="uploadDocument()" :disabled="uploading">Upload</button>
+          <div x-show="uploading" style="margin-top: 0.5rem;">
+            <progress :value="uploadProgress" max="100"></progress>
+            <small x-text="uploadProgress + '%'"></small>
+          </div>
+          <button x-show="uploadError && !uploading" class="secondary" @click="retryUpload()" style="margin-top: 0.5rem;">Retry</button>
+        </div>
+
+        <p x-show="uploadSuccess" style="color: #5cb85c; margin-top: 1rem;">
+          <strong>Document uploaded successfully!</strong>
+        </p>
+
+        <footer>
+          <button @click="backToList()">Back to events</button>
+        </footer>
+      </article>
+    </section>
+
+    <!-- Status Check Section -->
+    <section x-show="!selectedEvent && !registrationResult">
+      <article>
+        <header>
+          <h3>Check Registration Status</h3>
+        </header>
+        <p>Enter your registration ID to check the current status or upload a document:</p>
+        <form @submit.prevent="checkStatus()">
+          <label for="status-id">
+            Registration ID
+            <input type="text" id="status-id" x-model="statusCheckId" placeholder="xxxxxxxx-xxxx-4xxx-xxxx-xxxxxxxxxxxx">
+          </label>
+          <small x-show="statusError" style="color: #d9534f;" x-text="statusError"></small>
+          <button type="submit" :disabled="statusLoading" :aria-busy="statusLoading" x-text="statusLoading ? 'Checking...' : 'Check Status'"></button>
+        </form>
+
+        <!-- Status Result -->
+        <template x-if="statusResult && !registrationResult">
+          <div style="margin-top: 1rem; padding: 1rem; border: 1px solid #ccc; border-radius: 4px;">
+            <p><strong>Registration ID:</strong> <span x-text="statusResult.id"></span></p>
+            <p><strong>Status:</strong>
+              <span
+                :style="{
+                  color: 'white',
+                  padding: '0.2rem 0.5rem',
+                  borderRadius: '4px',
+                  fontSize: '0.85rem',
+                  backgroundColor: statusResult.status === 'PENDING_DOCUMENT' ? '#f0ad4e' :
+                                   statusResult.status === 'DOCUMENT_UPLOADED' ? '#5bc0de' :
+                                   statusResult.status === 'APPROVED' ? '#5cb85c' :
+                                   statusResult.status === 'REJECTED' ? '#d9534f' : '#6c757d'
+                }"
+                x-text="statusResult.status">
+              </span>
+            </p>
+            <p x-show="statusResult.rejectionReason"><strong>Reason:</strong> <span x-text="statusResult.rejectionReason"></span></p>
+          </div>
+        </template>
+      </article>
+    </section>
+
+    <!-- Event not found -->
+    <section x-show="error === 'Event not found' && !selectedEvent">
+      <article>
+        <p>Event not found</p>
+        <button @click="backToList()">Back to events</button>
+      </article>
+    </section>
+
+  </main>
+</body>
+</html>

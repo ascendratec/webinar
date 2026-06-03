@@ -1,0 +1,1276 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  EventHub Serverless - Plataforma de gestão de eventos e inscrições
+  construída com serviços AWS serverless.
+
+# =============================================================================
+# Globals
+# =============================================================================
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Timeout: 30
+    MemorySize: 256
+    Tracing: Active
+    Tags:
+      Project: EventHub
+      Environment: Workshop
+
+# =============================================================================
+# Parameters
+# =============================================================================
+Parameters:
+  AdminEmail:
+    Type: String
+    Description: E-mail do administrador para notificações via SNS
+  NATInstanceAMI:
+    Type: AWS::EC2::Image::Id
+    Default: ami-086c08b98cb348e57
+    Description: AMI ID do fck-nat para a região de deploy (us-east-1). Consultar https://fck-nat.dev para outras regiões.
+
+# =============================================================================
+# Resources
+# =============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # API Gateway — HTTP API com CORS
+  # ---------------------------------------------------------------------------
+  EventHubApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - X-Amz-Date
+          - Authorization
+          - X-Api-Key
+          - X-Amz-Security-Token
+          - x-correlation-id
+
+  # ---------------------------------------------------------------------------
+  # Lambda Layer — Powertools for AWS Lambda (TypeScript)
+  # ---------------------------------------------------------------------------
+  PowertoolsLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: PowertoolsForAWSLambdaTypeScript
+      Description: Lambda Powertools for TypeScript - logging, tracing, metrics
+      ContentUri: layers/powertools/
+      CompatibleRuntimes:
+        - nodejs22.x
+      RetentionPolicy: Delete
+    Metadata:
+      BuildMethod: nodejs22.x
+
+  # ---------------------------------------------------------------------------
+  # DynamoDB — Catálogo de Eventos
+  # ---------------------------------------------------------------------------
+  EventsCatalogTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${AWS::StackName}-EventsCatalog"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # ---------------------------------------------------------------------------
+  # VPC — Rede com subnets públicas e privadas
+  # ---------------------------------------------------------------------------
+  EventHubVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-VPC"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  # --- Internet Gateway ---
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-IGW"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref EventHubVPC
+
+  # --- Public Subnets ---
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref EventHubVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PublicSubnet1"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref EventHubVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PublicSubnet2"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  # --- Private Subnets ---
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref EventHubVPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PrivateSubnet1"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref EventHubVPC
+      CidrBlock: 10.0.4.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PrivateSubnet2"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  # --- Public Route Table ---
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref EventHubVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PublicRT"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # --- NAT Instance ---
+  NATInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for NAT Instance - allows outbound traffic
+      VpcId: !Ref EventHubVPC
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      SecurityGroupIngress:
+        - IpProtocol: "-1"
+          CidrIp: 10.0.0.0/16
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-NATInstance-SG"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  NATInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !Ref NATInstanceAMI
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref NATInstanceSecurityGroup
+      SourceDestCheck: false
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-NATInstance"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  NATInstanceEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-NATInstance-EIP"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  NATInstanceEIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref NATInstance
+      AllocationId: !GetAtt NATInstanceEIP.AllocationId
+
+  # --- Private Route Tables ---
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref EventHubVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PrivateRT1"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  PrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      InstanceId: !Ref NATInstance
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref EventHubVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-PrivateRT2"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  PrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      InstanceId: !Ref NATInstance
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable2
+
+  # ---------------------------------------------------------------------------
+  # Security Groups — Lambda e Aurora
+  # ---------------------------------------------------------------------------
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for Lambda functions - allows outbound to Aurora on port 5432
+      VpcId: !Ref EventHubVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-Lambda-SG"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  AuroraSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for Aurora cluster - allows inbound from Lambda on port 5432
+      VpcId: !Ref EventHubVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-Aurora-SG"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  LambdaSecurityGroupEgressToAurora:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      DestinationSecurityGroupId: !Ref AuroraSecurityGroup
+
+  LambdaSecurityGroupEgressHttps:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+
+  # ---------------------------------------------------------------------------
+  # Aurora Serverless v2 — PostgreSQL
+  # ---------------------------------------------------------------------------
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for Aurora Serverless v2 cluster (private subnets)
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-DBSubnetGroup"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: "16.4"
+      DBClusterIdentifier: !Sub "${AWS::StackName}-aurora-cluster"
+      MasterUsername: eventhubadmin
+      ManageMasterUserPassword: true
+      EnableHttpEndpoint: true
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 2
+      StorageEncrypted: true
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref AuroraSecurityGroup
+      Tags:
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  AuroraInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceIdentifier: !Sub "${AWS::StackName}-aurora-instance-1"
+      Tags:
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  # ---------------------------------------------------------------------------
+  # SQS — Dead Letter Queue para ProcessDocument
+  # ---------------------------------------------------------------------------
+  ProcessDocumentDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${AWS::StackName}-ProcessDocumentDLQ"
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  # ---------------------------------------------------------------------------
+  # SNS — Notificações de Alarmes
+  # ---------------------------------------------------------------------------
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${AWS::StackName}-AlarmNotifications"
+      Tags:
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: !Ref AdminEmail
+      TopicArn: !Ref AlarmNotificationTopic
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Alarms
+  # ---------------------------------------------------------------------------
+  ApiGateway5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-ApiGateway-5xx"
+      AlarmDescription: "API Gateway 5xx errors exceeded threshold"
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref EventHubApi
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+
+  DLQMessagesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-DLQ-Messages"
+      AlarmDescription: "Messages sent to ProcessDocument DLQ"
+      Namespace: AWS/SQS
+      MetricName: NumberOfMessagesSent
+      Dimensions:
+        - Name: QueueName
+          Value: !GetAtt ProcessDocumentDLQ.QueueName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+
+  ProcessDocumentErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${AWS::StackName}-ProcessDocument-Errors"
+      AlarmDescription: "ProcessDocument Lambda errors exceeded threshold"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProcessUploadedDocumentFunction
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+
+  # ---------------------------------------------------------------------------
+  # Lambda Functions
+  # ---------------------------------------------------------------------------
+  HealthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: health.handler
+      CodeUri: src/handlers/
+      Description: Health check endpoint
+      Layers:
+        - !Ref PowertoolsLayer
+      Events:
+        HealthCheck:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /health
+            Method: GET
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - health.ts
+
+  ListEventsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: list-events.handler
+      CodeUri: src/handlers/
+      Description: Listar eventos ativos
+      Layers:
+        - !Ref PowertoolsLayer
+      Environment:
+        Variables:
+          EVENTS_TABLE_NAME: !Ref EventsCatalogTable
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref EventsCatalogTable
+      Tags:
+        Service: list-events
+      Events:
+        ListEvents:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /events
+            Method: GET
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - list-events.ts
+
+  GetEventFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: get-event.handler
+      CodeUri: src/handlers/
+      Description: Detalhes de um evento por ID
+      Layers:
+        - !Ref PowertoolsLayer
+      Environment:
+        Variables:
+          EVENTS_TABLE_NAME: !Ref EventsCatalogTable
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref EventsCatalogTable
+      Tags:
+        Service: get-event
+      Events:
+        GetEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /events/{eventId}
+            Method: GET
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - get-event.ts
+
+  CreateEventFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: create-event.handler
+      CodeUri: src/handlers/
+      Description: Criar novo evento (admin)
+      Layers:
+        - !Ref PowertoolsLayer
+      Environment:
+        Variables:
+          EVENTS_TABLE_NAME: !Ref EventsCatalogTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsCatalogTable
+      Tags:
+        Service: create-event
+      Events:
+        CreateEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /admin/events
+            Method: POST
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - create-event.ts
+
+  DeleteEventFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: delete-event.handler
+      CodeUri: src/handlers/
+      Description: Deletar evento (admin)
+      Layers:
+        - !Ref PowertoolsLayer
+      Environment:
+        Variables:
+          EVENTS_TABLE_NAME: !Ref EventsCatalogTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsCatalogTable
+      Tags:
+        Service: delete-event
+      Events:
+        DeleteEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /admin/events/{eventId}
+            Method: DELETE
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - delete-event.ts
+
+  CreateRegistrationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: create-registration.handler
+      CodeUri: src/handlers/
+      Description: Criar inscrição em um evento
+      Layers:
+        - !Ref PowertoolsLayer
+      Environment:
+        Variables:
+          EVENTS_TABLE_NAME: !Ref EventsCatalogTable
+          PG_HOST: !GetAtt AuroraCluster.Endpoint.Address
+          PG_PORT: !GetAtt AuroraCluster.Endpoint.Port
+          PG_DATABASE: postgres
+          PG_USER: eventhubadmin
+          PG_SSL: "true"
+          DB_SECRET_ARN: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsCatalogTable
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+      Tags:
+        Service: create-registration
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Events:
+        CreateRegistration:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /registrations
+            Method: POST
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - create-registration.ts
+
+  GetRegistrationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: get-registration.handler
+      CodeUri: src/handlers/
+      Description: Detalhes de uma inscrição por ID
+      Layers:
+        - !Ref PowertoolsLayer
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          PG_HOST: !GetAtt AuroraCluster.Endpoint.Address
+          PG_PORT: !GetAtt AuroraCluster.Endpoint.Port
+          PG_DATABASE: postgres
+          PG_USER: eventhubadmin
+          PG_SSL: "true"
+          DB_SECRET_ARN: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+      Policies:
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+      Tags:
+        Service: get-registration
+      Events:
+        GetRegistration:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /registrations/{id}
+            Method: GET
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - get-registration.ts
+
+  GenerateUploadUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: generate-upload-url.handler
+      CodeUri: src/handlers/
+      Description: Gerar URL presigned para upload de documento
+      Layers:
+        - !Ref PowertoolsLayer
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          DOCUMENTS_BUCKET_NAME: !Sub "${AWS::StackName}-documents-${AWS::AccountId}"
+          PG_HOST: !GetAtt AuroraCluster.Endpoint.Address
+          PG_PORT: !GetAtt AuroraCluster.Endpoint.Port
+          PG_DATABASE: postgres
+          PG_USER: eventhubadmin
+          PG_SSL: "true"
+          DB_SECRET_ARN: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+      Policies:
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: !Sub "arn:aws:s3:::${AWS::StackName}-documents-${AWS::AccountId}/*"
+      Tags:
+        Service: generate-upload-url
+      Events:
+        GenerateUploadUrl:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /registrations/{id}/upload-url
+            Method: POST
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - generate-upload-url.ts
+
+  ProcessUploadedDocumentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: process-uploaded-document.handler
+      CodeUri: src/handlers/
+      Description: Processar documento enviado via S3 Event Notification
+      Layers:
+        - !Ref PowertoolsLayer
+      Environment:
+        Variables:
+          DOCUMENTS_BUCKET_NAME: !Sub "${AWS::StackName}-documents-${AWS::AccountId}"
+          PG_HOST: !GetAtt AuroraCluster.Endpoint.Address
+          PG_PORT: !GetAtt AuroraCluster.Endpoint.Port
+          PG_DATABASE: postgres
+          PG_USER: eventhubadmin
+          PG_SSL: "true"
+          DB_SECRET_ARN: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+      Policies:
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource: !Sub "arn:aws:s3:::${AWS::StackName}-documents-${AWS::AccountId}/*"
+      Tags:
+        Service: process-uploaded-document
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+        DestinationConfig:
+          OnFailure:
+            Type: SQS
+            Destination: !GetAtt ProcessDocumentDLQ.Arn
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - process-uploaded-document.ts
+
+  AdminListRegistrationsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: admin-list-registrations.handler
+      CodeUri: src/handlers/
+      Description: Listar todas as inscrições (admin)
+      Layers:
+        - !Ref PowertoolsLayer
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          PG_HOST: !GetAtt AuroraCluster.Endpoint.Address
+          PG_PORT: !GetAtt AuroraCluster.Endpoint.Port
+          PG_DATABASE: postgres
+          PG_USER: eventhubadmin
+          PG_SSL: "true"
+          DB_SECRET_ARN: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+      Policies:
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+      Tags:
+        Service: admin-list-registrations
+      Events:
+        AdminListRegistrations:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /admin/registrations
+            Method: GET
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - admin-list-registrations.ts
+
+  AdminGetRegistrationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: admin-get-registration.handler
+      CodeUri: src/handlers/
+      Description: Detalhes de uma inscrição com dados do participante (admin)
+      Layers:
+        - !Ref PowertoolsLayer
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          PG_HOST: !GetAtt AuroraCluster.Endpoint.Address
+          PG_PORT: !GetAtt AuroraCluster.Endpoint.Port
+          PG_DATABASE: postgres
+          PG_USER: eventhubadmin
+          PG_SSL: "true"
+          DB_SECRET_ARN: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+      Policies:
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+      Tags:
+        Service: admin-get-registration
+      Events:
+        AdminGetRegistration:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /admin/registrations/{id}
+            Method: GET
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - admin-get-registration.ts
+
+  SimulateErrorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: simulate-error.handler
+      CodeUri: src/handlers/
+      Description: Simular erro 500 para demonstração de alarmes
+      Layers:
+        - !Ref PowertoolsLayer
+      Tags:
+        Service: simulate-error
+      Events:
+        SimulateError:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /admin/simulate-error
+            Method: POST
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - simulate-error.ts
+
+  ApproveRegistrationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: approve-registration.handler
+      CodeUri: src/handlers/
+      Description: Aprovar inscrição com documento enviado
+      Layers:
+        - !Ref PowertoolsLayer
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          PG_HOST: !GetAtt AuroraCluster.Endpoint.Address
+          PG_PORT: !GetAtt AuroraCluster.Endpoint.Port
+          PG_DATABASE: postgres
+          PG_USER: eventhubadmin
+          PG_SSL: "true"
+          DB_SECRET_ARN: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+      Policies:
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+      Tags:
+        Service: approve-registration
+      Events:
+        ApproveRegistration:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /admin/registrations/{id}/approve
+            Method: POST
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - approve-registration.ts
+
+  RejectRegistrationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: reject-registration.handler
+      CodeUri: src/handlers/
+      Description: Rejeitar inscrição com motivo
+      Layers:
+        - !Ref PowertoolsLayer
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          PG_HOST: !GetAtt AuroraCluster.Endpoint.Address
+          PG_PORT: !GetAtt AuroraCluster.Endpoint.Port
+          PG_DATABASE: postgres
+          PG_USER: eventhubadmin
+          PG_SSL: "true"
+          DB_SECRET_ARN: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+      Policies:
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
+      Tags:
+        Service: reject-registration
+      Events:
+        RejectRegistration:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /admin/registrations/{id}/reject
+            Method: POST
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - reject-registration.ts
+
+  # ---------------------------------------------------------------------------
+  # S3 — Bucket de Documentos (APÓS Lambda functions para evitar dependência circular)
+  # ---------------------------------------------------------------------------
+  DocumentsBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: ProcessUploadedDocumentS3Permission
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-documents-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref DocumentsLogsBucket
+        LogFilePrefix: access-logs/
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins:
+              - "*"
+            AllowedMethods:
+              - PUT
+            AllowedHeaders:
+              - "*"
+            MaxAge: 3600
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !GetAtt ProcessUploadedDocumentFunction.Arn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: registrations/
+      Tags:
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  DocumentsLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-documents-logs-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  ProcessUploadedDocumentS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProcessUploadedDocumentFunction
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "arn:aws:s3:::${AWS::StackName}-documents-${AWS::AccountId}"
+      SourceAccount: !Ref AWS::AccountId
+
+  # ---------------------------------------------------------------------------
+  # Frontend — S3 Bucket para arquivos estáticos
+  # ---------------------------------------------------------------------------
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${AWS::StackName}-frontend-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  # ---------------------------------------------------------------------------
+  # CloudFront — Origin Access Control (OAC) for S3
+  # ---------------------------------------------------------------------------
+  FrontendOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${AWS::StackName}-frontend-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ---------------------------------------------------------------------------
+  # S3 Bucket Policy — CloudFront OAC Access
+  # ---------------------------------------------------------------------------
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}"
+
+  # ---------------------------------------------------------------------------
+  # CloudFront — Distribution
+  # ---------------------------------------------------------------------------
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt FrontendOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          ForwardedValues:
+            QueryString: false
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+      Tags:
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+# =============================================================================
+# Outputs
+# =============================================================================
+Outputs:
+  FrontendUrl:
+    Description: URL do frontend via CloudFront
+    Value: !Sub "https://${FrontendDistribution.DomainName}"
+  FrontendBucketName:
+    Description: Nome do bucket S3 para deploy do frontend
+    Value: !Ref FrontendBucket
+  FrontendDistributionId:
+    Description: ID da distribuição CloudFront
+    Value: !Ref FrontendDistribution
+  ApiUrl:
+    Description: URL do API Gateway HTTP API
+    Value: !Sub "https://${EventHubApi}.execute-api.${AWS::Region}.amazonaws.com"

@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>EventHub - Admin</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/@picocss/pico@2/css/pico.min.css">
+  <script src="app.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+</head>
+<body>
+  <main class="container" x-data="adminPage">
+    <!-- Notification bar -->
+    <div x-show="$store.notification.message"
+         x-transition
+         :style="'padding: 1rem; margin-bottom: 1rem; border-radius: 4px; display: flex; justify-content: space-between; align-items: center; color: #fff; background-color:' + ($store.notification.type === 'success' ? 'rgba(92, 184, 92, 0.9)' : 'rgba(217, 83, 79, 0.9)')"
+         role="alert">
+      <span x-text="$store.notification.message"></span>
+      <button @click="$store.notification.dismiss()"
+              style="background: transparent; border: 1px solid rgba(255,255,255,0.5); font-size: 1.2rem; cursor: pointer; padding: 0 0.5rem; color: #fff;"
+              aria-label="Dismiss notification">&times;</button>
+    </div>
+
+    <!-- Operational Tools Section -->
+    <section>
+      <h2>Operational Tools</h2>
+      <div style="display: flex; gap: 1rem; flex-wrap: wrap; align-items: flex-start;">
+        <!-- Health Check -->
+        <div style="flex: 1; min-width: 250px;">
+          <button @click="healthCheck()"
+                  :disabled="toolLoading === 'health'"
+                  :aria-busy="toolLoading === 'health'">
+            <span x-show="toolLoading !== 'health'">Health Check</span>
+            <span x-show="toolLoading === 'health'">Checking...</span>
+          </button>
+          <div x-show="healthResult" style="margin-top: 0.5rem;">
+            <small>
+              <strong>Status:</strong> <span x-text="healthResult?.status"></span><br>
+              <strong>Timestamp:</strong> <span x-text="healthResult?.timestamp"></span>
+            </small>
+          </div>
+        </div>
+
+        <!-- Simulate Error -->
+        <div style="flex: 1; min-width: 250px;">
+          <button @click="simulateError()"
+                  :disabled="toolLoading === 'simulate'"
+                  :aria-busy="toolLoading === 'simulate'"
+                  class="secondary">
+            <span x-show="toolLoading !== 'simulate'">Simulate Error</span>
+            <span x-show="toolLoading === 'simulate'">Simulating...</span>
+          </button>
+          <div x-show="simulateResult" style="margin-top: 0.5rem;">
+            <small>
+              <strong>HTTP Status:</strong> <span x-text="simulateResult?.statusCode"></span><br>
+              <strong>Message:</strong> <span x-text="simulateResult?.message"></span>
+            </small>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Create Event Section -->
+    <section>
+      <h2>Create Event</h2>
+      <article>
+        <form @submit.prevent="createEvent()">
+          <label for="event-title">
+            Title
+            <input type="text" id="event-title" x-model="newEvent.title" placeholder="Event title (3-200 chars)" required>
+          </label>
+
+          <label for="event-description">
+            Description
+            <textarea id="event-description" x-model="newEvent.description" placeholder="Event description (10-2000 chars)" rows="3" required></textarea>
+          </label>
+
+          <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 1rem;">
+            <label for="event-date">
+              Date
+              <input type="datetime-local" id="event-date" x-model="newEvent.date" required>
+            </label>
+
+            <label for="event-location">
+              Location
+              <input type="text" id="event-location" x-model="newEvent.location" placeholder="Event location" required>
+            </label>
+          </div>
+
+          <label for="event-capacity">
+            Capacity
+            <input type="number" id="event-capacity" x-model.number="newEvent.capacity" min="1" max="10000" placeholder="Max participants" required>
+          </label>
+
+          <button type="submit" :disabled="creatingEvent" :aria-busy="creatingEvent" x-text="creatingEvent ? 'Creating...' : 'Create Event'"></button>
+        </form>
+
+        <!-- Created Event Result -->
+        <div x-show="createdEvent" style="margin-top: 1rem; padding: 1rem; background-color: rgba(92, 184, 92, 0.9); border-radius: 4px; color: #fff;">
+          <p><strong>Event created successfully!</strong></p>
+          <small>
+            <strong>ID:</strong> <span x-text="createdEvent?.eventId"></span><br>
+            <strong>Title:</strong> <span x-text="createdEvent?.title"></span><br>
+            <strong>Available Slots:</strong> <span x-text="createdEvent?.availableSlots"></span>
+          </small>
+        </div>
+      </article>
+    </section>
+
+    <!-- Manage Events Section -->
+    <section>
+      <h2>Events</h2>
+      <p x-show="eventsLoading" aria-busy="true">Loading events...</p>
+      <p x-show="!eventsLoading && events.length === 0">No events found.</p>
+      <template x-for="ev in events" :key="ev.eventId">
+        <article style="display: flex; justify-content: space-between; align-items: center; padding: 0.75rem 1rem;">
+          <div>
+            <strong x-text="ev.title"></strong>
+            <small x-text="' — ' + new Date(ev.date).toLocaleDateString() + ' — ' + ev.availableSlots + '/' + ev.capacity + ' slots'"></small>
+          </div>
+          <button @click="deleteEvent(ev.eventId)"
+                  :disabled="deletingEvent === ev.eventId"
+                  :aria-busy="deletingEvent === ev.eventId"
+                  class="secondary"
+                  style="margin: 0; width: auto; padding: 0.4rem 0.8rem;">
+            Delete
+          </button>
+        </article>
+      </template>
+    </section>
+
+    <!-- Registration List Section -->
+    <section x-show="!selectedRegistration">
+      <h2>Registrations</h2>
+
+      <!-- Loading indicator -->
+      <p x-show="loading" aria-busy="true">Loading registrations...</p>
+
+      <!-- 404 error with back navigation -->
+      <div x-show="error === 'Registration not found'" role="alert">
+        <p style="color: #721c24;">Registration not found.</p>
+        <button @click="backToList(); error = null;">Back to list</button>
+      </div>
+
+      <!-- General error with retry -->
+      <div x-show="error && error !== 'Registration not found'" role="alert">
+        <p x-text="error" style="color: #721c24;"></p>
+        <button @click="fetchRegistrations()">Retry</button>
+      </div>
+
+      <!-- Empty state -->
+      <p x-show="!loading && !error && registrations.length === 0">No registrations found.</p>
+
+      <!-- Registration table -->
+      <div x-show="!loading && !error && registrations.length > 0" style="overflow-x: auto;">
+        <table role="grid">
+          <thead>
+            <tr>
+              <th>ID</th>
+              <th>Participant Name</th>
+              <th>Event Title</th>
+              <th>Status</th>
+              <th>Created At</th>
+            </tr>
+          </thead>
+          <tbody>
+            <template x-for="reg in registrations" :key="reg.id">
+              <tr @click="viewRegistration(reg.id)" style="cursor: pointer;">
+                <td x-text="reg.id.substring(0, 8) + '...'"></td>
+                <td x-text="reg.participantName || reg.participantId"></td>
+                <td x-text="reg.eventTitle || reg.eventId"></td>
+                <td>
+                  <span
+                    x-text="reg.status.replace(/_/g, ' ')"
+                    :style="'padding: 0.2rem 0.6rem; border-radius: 4px; font-size: 0.8rem; font-weight: bold; color: #fff; background-color:' + (reg.status === 'PENDING_DOCUMENT' ? '#f0ad4e' : reg.status === 'DOCUMENT_UPLOADED' ? '#5bc0de' : reg.status === 'APPROVED' ? '#5cb85c' : reg.status === 'REJECTED' ? '#d9534f' : '#999')"
+                  ></span>
+                </td>
+                <td x-text="(() => { const d = new Date(reg.createdAt); return String(d.getDate()).padStart(2,'0') + '/' + String(d.getMonth()+1).padStart(2,'0') + '/' + d.getFullYear() + ' ' + String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0'); })()"></td>
+              </tr>
+            </template>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+    <!-- Registration Detail Section -->
+    <section x-show="selectedRegistration">
+      <!-- Detail loading -->
+      <p x-show="detailLoading" aria-busy="true">Loading registration details...</p>
+
+      <!-- Registration details -->
+      <article x-show="selectedRegistration && !detailLoading">
+        <header>
+          <h3>Registration Details</h3>
+          <button @click="backToList()" class="secondary outline" style="float: right;">Back to list</button>
+        </header>
+
+        <div style="clear: both;">
+          <dl>
+            <dt>Participant Name</dt>
+            <dd x-text="selectedRegistration?.participantName || ''"></dd>
+
+            <dt>Email</dt>
+            <dd x-text="selectedRegistration?.participantEmail || selectedRegistration?.email || ''"></dd>
+
+            <dt>Event</dt>
+            <dd x-text="selectedRegistration?.eventName || selectedRegistration?.eventTitle || ''"></dd>
+
+            <dt>Status</dt>
+            <dd>
+              <span
+                x-text="selectedRegistration ? selectedRegistration.status.replace(/_/g, ' ') : ''"
+                :style="selectedRegistration ? 'padding: 0.2rem 0.6rem; border-radius: 4px; font-size: 0.8rem; font-weight: bold; color: #fff; background-color:' + (selectedRegistration.status === 'PENDING_DOCUMENT' ? '#f0ad4e' : selectedRegistration.status === 'DOCUMENT_UPLOADED' ? '#5bc0de' : selectedRegistration.status === 'APPROVED' ? '#5cb85c' : selectedRegistration.status === 'REJECTED' ? '#d9534f' : '#999') : ''"
+              ></span>
+            </dd>
+
+            <dt>Document S3 Key</dt>
+            <dd x-text="selectedRegistration?.documentS3Key || 'N/A'"></dd>
+
+            <dt>Created At</dt>
+            <dd x-text="selectedRegistration ? (() => { const d = new Date(selectedRegistration.createdAt); return String(d.getDate()).padStart(2,'0') + '/' + String(d.getMonth()+1).padStart(2,'0') + '/' + d.getFullYear() + ' ' + String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0'); })() : ''"></dd>
+
+            <dt>Updated At</dt>
+            <dd x-text="selectedRegistration ? (() => { const d = new Date(selectedRegistration.updatedAt); return String(d.getDate()).padStart(2,'0') + '/' + String(d.getMonth()+1).padStart(2,'0') + '/' + d.getFullYear() + ' ' + String(d.getHours()).padStart(2,'0') + ':' + String(d.getMinutes()).padStart(2,'0'); })() : ''"></dd>
+          </dl>
+        </div>
+
+        <!-- Approve/Reject Actions -->
+        <div x-show="selectedRegistration && selectedRegistration.status === 'DOCUMENT_UPLOADED'" style="margin-top: 1.5rem; border-top: 1px solid #e0e0e0; padding-top: 1rem;">
+          <h4>Actions</h4>
+          <div style="display: flex; gap: 1rem; flex-wrap: wrap; align-items: flex-start;">
+            <!-- Approve Button -->
+            <button @click="approveRegistration(selectedRegistration.id)"
+                    :disabled="actionLoading"
+                    :aria-busy="actionLoading">
+              <span x-show="!actionLoading">Approve</span>
+              <span x-show="actionLoading">Approving...</span>
+            </button>
+
+            <!-- Reject Button -->
+            <button @click="showRejectPrompt = true"
+                    :disabled="actionLoading"
+                    class="contrast"
+                    x-show="!showRejectPrompt">
+              Reject
+            </button>
+          </div>
+
+          <!-- Reject Reason Prompt -->
+          <div x-show="showRejectPrompt" style="margin-top: 1rem;">
+            <label for="reject-reason">Rejection Reason</label>
+            <input type="text"
+                   id="reject-reason"
+                   x-model="rejectReason"
+                   placeholder="Enter rejection reason (1-500 characters)"
+                   maxlength="500"
+                   :disabled="actionLoading">
+            <small x-text="rejectReason.length + '/500 characters'"></small>
+            <div style="display: flex; gap: 0.5rem; margin-top: 0.5rem;">
+              <button @click="rejectRegistration(selectedRegistration.id)"
+                      :disabled="actionLoading || rejectReason.trim().length < 1 || rejectReason.trim().length > 500"
+                      :aria-busy="actionLoading"
+                      class="contrast">
+                <span x-show="!actionLoading">Confirm Reject</span>
+                <span x-show="actionLoading">Rejecting...</span>
+              </button>
+              <button @click="showRejectPrompt = false; rejectReason = ''"
+                      :disabled="actionLoading"
+                      class="secondary outline">
+                Cancel
+              </button>
+            </div>
+          </div>
+        </div>
+      </article>
+    </section>
+  </main>
+</body>
+</html>
