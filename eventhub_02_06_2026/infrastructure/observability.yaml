@@ -1,0 +1,116 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  EventHub — Observability: SNS, CloudWatch Alarms
+
+# =============================================================================
+# This stack sets up alerting and monitoring:
+# - SNS topic + email subscription for alarm notifications
+# - CloudWatch Alarms that detect:
+#   1. API Gateway returning too many 5xx errors
+#   2. Messages arriving in the DLQ (document processing failures)
+#   3. ProcessDocument Lambda throwing errors repeatedly
+#
+# When any alarm fires, it publishes to SNS → email to the admin.
+# =============================================================================
+
+Parameters:
+  StackName:
+    Type: String
+  AdminEmail:
+    Type: String
+  ApiId:
+    Type: String
+  ProcessUploadedDocumentFunctionName:
+    Type: String
+  ProcessDocumentDLQName:
+    Type: String
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # SNS — Notificações de Alarmes
+  # Central notification channel. All alarms publish here.
+  # The email subscription sends alerts to the admin — requires manual
+  # confirmation (check inbox after first deploy).
+  # ---------------------------------------------------------------------------
+  AlarmNotificationTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${StackName}-AlarmNotifications"
+      Tags:
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  AlarmEmailSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: !Ref AdminEmail
+      TopicArn: !Ref AlarmNotificationTopic
+
+  # ---------------------------------------------------------------------------
+  # CloudWatch Alarms
+  # Three alarms covering the main failure modes:
+  # 1. ApiGateway5xx: >5 server errors in 5 min → something is broken
+  # 2. DLQMessages: ≥1 message in DLQ → document processing is failing
+  # 3. ProcessDocumentErrors: >3 Lambda errors in 5 min → sustained failure
+  # ---------------------------------------------------------------------------
+  ApiGateway5xxAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${StackName}-ApiGateway-5xx"
+      AlarmDescription: "API Gateway 5xx errors exceeded threshold"
+      Namespace: AWS/ApiGateway
+      MetricName: 5xx
+      Dimensions:
+        - Name: ApiId
+          Value: !Ref ApiId
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 5
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+
+  DLQMessagesAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${StackName}-DLQ-Messages"
+      AlarmDescription: "Messages sent to ProcessDocument DLQ"
+      Namespace: AWS/SQS
+      MetricName: NumberOfMessagesSent
+      Dimensions:
+        - Name: QueueName
+          Value: !Ref ProcessDocumentDLQName
+      Statistic: Sum
+      Period: 60
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+
+  ProcessDocumentErrorsAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub "${StackName}-ProcessDocument-Errors"
+      AlarmDescription: "ProcessDocument Lambda errors exceeded threshold"
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions:
+        - Name: FunctionName
+          Value: !Ref ProcessUploadedDocumentFunctionName
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 3
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+        - !Ref AlarmNotificationTopic
+
+Outputs:
+  AlarmNotificationTopicArn:
+    Value: !Ref AlarmNotificationTopic

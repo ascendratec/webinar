@@ -1,0 +1,121 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  EventHub — Storage: S3 Buckets for Documents and Logs
+
+# =============================================================================
+# This stack manages document storage:
+# - Documents bucket: where participants upload registration documents via
+#   presigned URLs. An S3 event notification triggers ProcessUploadedDocument
+#   Lambda when new objects arrive under the registrations/ prefix.
+# - Logs bucket: stores S3 access logs for the documents bucket (audit trail).
+# - Lambda permission: allows S3 service to invoke the processing function.
+# =============================================================================
+
+Parameters:
+  StackName:
+    Type: String
+  ProcessUploadedDocumentFunctionArn:
+    Type: String
+    Description: ARN of the ProcessUploadedDocument Lambda function
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # S3 — Bucket de Documentos
+  # Stores uploaded files (PDFs, images) from participants.
+  # Security: AES256 encryption, versioning, all public access blocked.
+  # CORS: allows PUT from any origin (for browser-based presigned uploads).
+  # Notification: triggers Lambda on s3:ObjectCreated under registrations/.
+  # DependsOn the Lambda permission to avoid a race condition (S3 needs
+  # permission to invoke Lambda before the notification can be configured).
+  # ---------------------------------------------------------------------------
+  DocumentsBucket:
+    Type: AWS::S3::Bucket
+    DependsOn: ProcessUploadedDocumentS3Permission
+    Properties:
+      BucketName: !Sub "${StackName}-documents-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      LoggingConfiguration:
+        DestinationBucketName: !Ref DocumentsLogsBucket
+        LogFilePrefix: access-logs/
+      CorsConfiguration:
+        CorsRules:
+          - AllowedOrigins:
+              - "*"
+            AllowedMethods:
+              - PUT
+            AllowedHeaders:
+              - "*"
+            MaxAge: 3600
+      NotificationConfiguration:
+        LambdaConfigurations:
+          - Event: s3:ObjectCreated:*
+            Function: !Ref ProcessUploadedDocumentFunctionArn
+            Filter:
+              S3Key:
+                Rules:
+                  - Name: prefix
+                    Value: registrations/
+      Tags:
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  # ---------------------------------------------------------------------------
+  # S3 — Logs Bucket
+  # Dedicated bucket for S3 server access logs from the documents bucket.
+  # Separated from the main bucket to avoid recursive logging.
+  # Same security posture: encrypted, versioned, no public access.
+  # ---------------------------------------------------------------------------
+  DocumentsLogsBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${StackName}-documents-logs-${AWS::AccountId}"
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      VersioningConfiguration:
+        Status: Enabled
+      Tags:
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  # ---------------------------------------------------------------------------
+  # Lambda Permission for S3 Notification
+  # Grants the S3 service principal permission to invoke our Lambda function.
+  # Scoped to the specific bucket ARN and account to prevent cross-account
+  # invocations. Must exist BEFORE the bucket's NotificationConfiguration.
+  # ---------------------------------------------------------------------------
+  ProcessUploadedDocumentS3Permission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ProcessUploadedDocumentFunctionArn
+      Action: lambda:InvokeFunction
+      Principal: s3.amazonaws.com
+      SourceArn: !Sub "arn:aws:s3:::${StackName}-documents-${AWS::AccountId}"
+      SourceAccount: !Ref AWS::AccountId
+
+Outputs:
+  DocumentsBucketName:
+    Value: !Ref DocumentsBucket
+  DocumentsBucketArn:
+    Value: !GetAtt DocumentsBucket.Arn

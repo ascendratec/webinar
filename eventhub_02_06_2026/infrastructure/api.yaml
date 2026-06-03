@@ -1,0 +1,928 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  EventHub — API: HTTP API Gateway, Lambda Layer, Lambda Functions
+
+# =============================================================================
+# This stack contains the application logic:
+# - HTTP API Gateway (API Gateway v2) — lightweight, low-latency REST router
+# - Lambda Layer with AWS Powertools (structured logging, tracing, metrics)
+# - All Lambda handler functions (Node.js 22, TypeScript, esbuild-bundled)
+# - SQS Dead Letter Queue for failed async document processing
+#
+# Functions are split into:
+# - Public: health, list/get events, create registration, upload URL
+# - Admin: create/delete events, list/get/approve/reject registrations
+# - Async: process uploaded document (S3 trigger, not HTTP)
+# =============================================================================
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Timeout: 30
+    MemorySize: 256
+    Tracing: Active
+    Tags:
+      Project: EventHub
+      Environment: Workshop
+
+Parameters:
+  StackName:
+    Type: String
+  EventsCatalogTableName:
+    Type: String
+  EventsCatalogTableArn:
+    Type: String
+  LambdaSecurityGroupId:
+    Type: String
+  PrivateSubnet1Id:
+    Type: String
+  PrivateSubnet2Id:
+    Type: String
+  AuroraClusterEndpoint:
+    Type: String
+  AuroraClusterPort:
+    Type: String
+  AuroraSecretArn:
+    Type: String
+  AdminEmail:
+    Type: String
+    Description: Email for real-time critical error notifications
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # SQS — Dead Letter Queue para ProcessDocument
+  # Captures failed async invocations of ProcessUploadedDocumentFunction.
+  # 14-day retention (1209600 seconds) gives ops time to investigate failures.
+  # An alarm in observability.yaml fires when messages arrive here.
+  # ---------------------------------------------------------------------------
+  ProcessDocumentDLQ:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub "${StackName}-ProcessDocumentDLQ"
+      MessageRetentionPeriod: 1209600
+      Tags:
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  # ---------------------------------------------------------------------------
+  # API Gateway — HTTP API (v2) com CORS
+  # Lightweight HTTP API (cheaper and faster than REST API v1).
+  # CORS configured to allow all origins (*) — appropriate for a workshop demo.
+  # Routes are defined via Events on each Lambda function below.
+  # ---------------------------------------------------------------------------
+  EventHubApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      StageName: $default
+      CorsConfiguration:
+        AllowOrigins:
+          - "*"
+        AllowMethods:
+          - GET
+          - POST
+          - PUT
+          - DELETE
+          - OPTIONS
+        AllowHeaders:
+          - Content-Type
+          - X-Amz-Date
+          - Authorization
+          - X-Api-Key
+          - X-Amz-Security-Token
+          - x-correlation-id
+
+  # ---------------------------------------------------------------------------
+  # Lambda Layer — Powertools for AWS Lambda (TypeScript)
+  # Shared dependency layer containing @aws-lambda-powertools packages:
+  # - Logger: structured JSON logging with correlation IDs
+  # - Tracer: X-Ray tracing with automatic SDK patching
+  # - Metrics: custom CloudWatch metrics (namespace: EventHub)
+  # Built via SAM's nodejs22.x BuildMethod (runs npm install in the layer).
+  # ---------------------------------------------------------------------------
+  PowertoolsLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: PowertoolsForAWSLambdaTypeScript
+      Description: Lambda Powertools for TypeScript - logging, tracing, metrics
+      ContentUri: ../layers/powertools/
+      CompatibleRuntimes:
+        - nodejs22.x
+      RetentionPolicy: Delete
+    Metadata:
+      BuildMethod: nodejs22.x
+
+  # ---------------------------------------------------------------------------
+  # Lambda Functions — Health & Events (DynamoDB only, no VPC needed)
+  # These functions only access DynamoDB (public AWS endpoint), so they don't
+  # need VPC attachment. This means faster cold starts and no NAT dependency.
+  # Each function uses esbuild for bundling (tree-shaking, minification).
+  # ---------------------------------------------------------------------------
+  HealthFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: health.handler
+      CodeUri: ../src/handlers/
+      Description: Health check endpoint
+      Layers:
+        - !Ref PowertoolsLayer
+      Events:
+        HealthCheck:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /health
+            Method: GET
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - health.ts
+
+  ListEventsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: list-events.handler
+      CodeUri: ../src/handlers/
+      Description: Listar eventos ativos
+      Layers:
+        - !Ref PowertoolsLayer
+      Environment:
+        Variables:
+          EVENTS_TABLE_NAME: !Ref EventsCatalogTableName
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref EventsCatalogTableName
+      Tags:
+        Service: list-events
+      Events:
+        ListEvents:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /events
+            Method: GET
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - list-events.ts
+
+  GetEventFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: get-event.handler
+      CodeUri: ../src/handlers/
+      Description: Detalhes de um evento por ID
+      Layers:
+        - !Ref PowertoolsLayer
+      Environment:
+        Variables:
+          EVENTS_TABLE_NAME: !Ref EventsCatalogTableName
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref EventsCatalogTableName
+      Tags:
+        Service: get-event
+      Events:
+        GetEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /events/{eventId}
+            Method: GET
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - get-event.ts
+
+  CreateEventFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: create-event.handler
+      CodeUri: ../src/handlers/
+      Description: Criar novo evento (admin)
+      Layers:
+        - !Ref PowertoolsLayer
+      Environment:
+        Variables:
+          EVENTS_TABLE_NAME: !Ref EventsCatalogTableName
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsCatalogTableName
+      Tags:
+        Service: create-event
+      Events:
+        CreateEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /admin/events
+            Method: POST
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - create-event.ts
+
+  DeleteEventFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: delete-event.handler
+      CodeUri: ../src/handlers/
+      Description: Deletar evento (admin)
+      Layers:
+        - !Ref PowertoolsLayer
+      Environment:
+        Variables:
+          EVENTS_TABLE_NAME: !Ref EventsCatalogTableName
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsCatalogTableName
+      Tags:
+        Service: delete-event
+      Events:
+        DeleteEvent:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /admin/events/{eventId}
+            Method: DELETE
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - delete-event.ts
+
+  # ---------------------------------------------------------------------------
+  # Lambda Functions — Registrations (VPC-attached, Aurora + DynamoDB access)
+  # These functions connect to Aurora in private subnets, so they must be
+  # VPC-attached. They also access Secrets Manager to retrieve the DB password.
+  # CreateRegistration is the most complex: Aurora TX + DynamoDB conditional
+  # update + compensation logic if the DynamoDB step fails.
+  # ---------------------------------------------------------------------------
+  CreateRegistrationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: create-registration.handler
+      CodeUri: ../src/handlers/
+      Description: Criar inscrição em um evento
+      Layers:
+        - !Ref PowertoolsLayer
+      Environment:
+        Variables:
+          EVENTS_TABLE_NAME: !Ref EventsCatalogTableName
+          PG_HOST: !Ref AuroraClusterEndpoint
+          PG_PORT: !Ref AuroraClusterPort
+          PG_DATABASE: postgres
+          PG_USER: eventhubadmin
+          PG_SSL: "true"
+          DB_SECRET_ARN: !Ref AuroraSecretArn
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsCatalogTableName
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref AuroraSecretArn
+      Tags:
+        Service: create-registration
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroupId
+        SubnetIds:
+          - !Ref PrivateSubnet1Id
+          - !Ref PrivateSubnet2Id
+      Events:
+        CreateRegistration:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /registrations
+            Method: POST
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - create-registration.ts
+
+  GetRegistrationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: get-registration.handler
+      CodeUri: ../src/handlers/
+      Description: Detalhes de uma inscrição por ID
+      Layers:
+        - !Ref PowertoolsLayer
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroupId
+        SubnetIds:
+          - !Ref PrivateSubnet1Id
+          - !Ref PrivateSubnet2Id
+      Environment:
+        Variables:
+          PG_HOST: !Ref AuroraClusterEndpoint
+          PG_PORT: !Ref AuroraClusterPort
+          PG_DATABASE: postgres
+          PG_USER: eventhubadmin
+          PG_SSL: "true"
+          DB_SECRET_ARN: !Ref AuroraSecretArn
+      Policies:
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref AuroraSecretArn
+      Tags:
+        Service: get-registration
+      Events:
+        GetRegistration:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /registrations/{id}
+            Method: GET
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - get-registration.ts
+
+  GenerateUploadUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: generate-upload-url.handler
+      CodeUri: ../src/handlers/
+      Description: Gerar URL presigned para upload de documento
+      Layers:
+        - !Ref PowertoolsLayer
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroupId
+        SubnetIds:
+          - !Ref PrivateSubnet1Id
+          - !Ref PrivateSubnet2Id
+      Environment:
+        Variables:
+          DOCUMENTS_BUCKET_NAME: !Sub "${StackName}-documents-${AWS::AccountId}"
+          PG_HOST: !Ref AuroraClusterEndpoint
+          PG_PORT: !Ref AuroraClusterPort
+          PG_DATABASE: postgres
+          PG_USER: eventhubadmin
+          PG_SSL: "true"
+          DB_SECRET_ARN: !Ref AuroraSecretArn
+      Policies:
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref AuroraSecretArn
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+                - s3:PutObject
+                - s3:DeleteObject
+              Resource: !Sub "arn:aws:s3:::${StackName}-documents-${AWS::AccountId}/*"
+      Tags:
+        Service: generate-upload-url
+      Events:
+        GenerateUploadUrl:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /registrations/{id}/upload-url
+            Method: POST
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - generate-upload-url.ts
+
+  ProcessUploadedDocumentFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: process-uploaded-document.handler
+      CodeUri: ../src/handlers/
+      Description: Processar documento enviado via S3 Event Notification
+      Layers:
+        - !Ref PowertoolsLayer
+      Environment:
+        Variables:
+          DOCUMENTS_BUCKET_NAME: !Sub "${StackName}-documents-${AWS::AccountId}"
+          PG_HOST: !Ref AuroraClusterEndpoint
+          PG_PORT: !Ref AuroraClusterPort
+          PG_DATABASE: postgres
+          PG_USER: eventhubadmin
+          PG_SSL: "true"
+          DB_SECRET_ARN: !Ref AuroraSecretArn
+      Policies:
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref AuroraSecretArn
+        - Statement:
+            - Effect: Allow
+              Action:
+                - s3:GetObject
+              Resource: !Sub "arn:aws:s3:::${StackName}-documents-${AWS::AccountId}/*"
+      Tags:
+        Service: process-uploaded-document
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroupId
+        SubnetIds:
+          - !Ref PrivateSubnet1Id
+          - !Ref PrivateSubnet2Id
+      EventInvokeConfig:
+        MaximumRetryAttempts: 2
+        DestinationConfig:
+          OnFailure:
+            Type: SQS
+            Destination: !GetAtt ProcessDocumentDLQ.Arn
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - process-uploaded-document.ts
+
+  # ---------------------------------------------------------------------------
+  # Lambda Functions — Admin Registrations (VPC-attached, Aurora read/write)
+  # Admin endpoints for managing registrations. All VPC-attached for Aurora.
+  # Approve/Reject transition the registration state machine and create
+  # audit log entries in the registration_audit_logs table.
+  # ---------------------------------------------------------------------------
+  AdminListRegistrationsFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: admin-list-registrations.handler
+      CodeUri: ../src/handlers/
+      Description: Listar todas as inscrições (admin)
+      Layers:
+        - !Ref PowertoolsLayer
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroupId
+        SubnetIds:
+          - !Ref PrivateSubnet1Id
+          - !Ref PrivateSubnet2Id
+      Environment:
+        Variables:
+          PG_HOST: !Ref AuroraClusterEndpoint
+          PG_PORT: !Ref AuroraClusterPort
+          PG_DATABASE: postgres
+          PG_USER: eventhubadmin
+          PG_SSL: "true"
+          DB_SECRET_ARN: !Ref AuroraSecretArn
+      Policies:
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref AuroraSecretArn
+      Tags:
+        Service: admin-list-registrations
+      Events:
+        AdminListRegistrations:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /admin/registrations
+            Method: GET
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - admin-list-registrations.ts
+
+  AdminGetRegistrationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: admin-get-registration.handler
+      CodeUri: ../src/handlers/
+      Description: Detalhes de uma inscrição com dados do participante (admin)
+      Layers:
+        - !Ref PowertoolsLayer
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroupId
+        SubnetIds:
+          - !Ref PrivateSubnet1Id
+          - !Ref PrivateSubnet2Id
+      Environment:
+        Variables:
+          PG_HOST: !Ref AuroraClusterEndpoint
+          PG_PORT: !Ref AuroraClusterPort
+          PG_DATABASE: postgres
+          PG_USER: eventhubadmin
+          PG_SSL: "true"
+          DB_SECRET_ARN: !Ref AuroraSecretArn
+      Policies:
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref AuroraSecretArn
+      Tags:
+        Service: admin-get-registration
+      Events:
+        AdminGetRegistration:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /admin/registrations/{id}
+            Method: GET
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - admin-get-registration.ts
+
+  AdminDeleteRegistrationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: admin-delete-registration.handler
+      CodeUri: ../src/handlers/
+      Description: Deletar inscrição e restaurar vaga (admin)
+      Layers:
+        - !Ref PowertoolsLayer
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroupId
+        SubnetIds:
+          - !Ref PrivateSubnet1Id
+          - !Ref PrivateSubnet2Id
+      Environment:
+        Variables:
+          EVENTS_TABLE_NAME: !Ref EventsCatalogTableName
+          PG_HOST: !Ref AuroraClusterEndpoint
+          PG_PORT: !Ref AuroraClusterPort
+          PG_DATABASE: postgres
+          PG_USER: eventhubadmin
+          PG_SSL: "true"
+          DB_SECRET_ARN: !Ref AuroraSecretArn
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref EventsCatalogTableName
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref AuroraSecretArn
+      Tags:
+        Service: admin-delete-registration
+      Events:
+        AdminDeleteRegistration:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /admin/registrations/{id}
+            Method: DELETE
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - admin-delete-registration.ts
+
+  ApproveRegistrationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: approve-registration.handler
+      CodeUri: ../src/handlers/
+      Description: Aprovar inscrição com documento enviado
+      Layers:
+        - !Ref PowertoolsLayer
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroupId
+        SubnetIds:
+          - !Ref PrivateSubnet1Id
+          - !Ref PrivateSubnet2Id
+      Environment:
+        Variables:
+          PG_HOST: !Ref AuroraClusterEndpoint
+          PG_PORT: !Ref AuroraClusterPort
+          PG_DATABASE: postgres
+          PG_USER: eventhubadmin
+          PG_SSL: "true"
+          DB_SECRET_ARN: !Ref AuroraSecretArn
+      Policies:
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref AuroraSecretArn
+      Tags:
+        Service: approve-registration
+      Events:
+        ApproveRegistration:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /admin/registrations/{id}/approve
+            Method: POST
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - approve-registration.ts
+
+  RejectRegistrationFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: reject-registration.handler
+      CodeUri: ../src/handlers/
+      Description: Rejeitar inscrição com motivo
+      Layers:
+        - !Ref PowertoolsLayer
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroupId
+        SubnetIds:
+          - !Ref PrivateSubnet1Id
+          - !Ref PrivateSubnet2Id
+      Environment:
+        Variables:
+          PG_HOST: !Ref AuroraClusterEndpoint
+          PG_PORT: !Ref AuroraClusterPort
+          PG_DATABASE: postgres
+          PG_USER: eventhubadmin
+          PG_SSL: "true"
+          DB_SECRET_ARN: !Ref AuroraSecretArn
+      Policies:
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref AuroraSecretArn
+      Tags:
+        Service: reject-registration
+      Events:
+        RejectRegistration:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /admin/registrations/{id}/reject
+            Method: POST
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - reject-registration.ts
+
+  SimulateErrorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: simulate-error.handler
+      CodeUri: ../src/handlers/
+      Description: Simular erro 500 para demonstração de alarmes
+      Layers:
+        - !Ref PowertoolsLayer
+      Tags:
+        Service: simulate-error
+      Events:
+        SimulateError:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /admin/simulate-error
+            Method: POST
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - simulate-error.ts
+
+  # ---------------------------------------------------------------------------
+  # EventBridge Scheduler — Auto-Approve Demo
+  # Runs every 1 minute. Queries Aurora for registrations with status
+  # DOCUMENT_UPLOADED where participant name = "Teste 123" and auto-approves.
+  # Demonstrates: scheduled jobs, EventBridge rules, serverless cron.
+  # ---------------------------------------------------------------------------
+  AutoApproveSchedulerFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: auto-approve-scheduler.handler
+      CodeUri: ../src/handlers/
+      Description: Scheduler que auto-aprova inscrições do participante "Teste 123"
+      Timeout: 30
+      Layers:
+        - !Ref PowertoolsLayer
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroupId
+        SubnetIds:
+          - !Ref PrivateSubnet1Id
+          - !Ref PrivateSubnet2Id
+      Environment:
+        Variables:
+          PG_HOST: !Ref AuroraClusterEndpoint
+          PG_PORT: !Ref AuroraClusterPort
+          PG_DATABASE: postgres
+          PG_USER: eventhubadmin
+          PG_SSL: "true"
+          DB_SECRET_ARN: !Ref AuroraSecretArn
+      Policies:
+        - VPCAccessPolicy: {}
+        - Statement:
+            - Effect: Allow
+              Action:
+                - secretsmanager:GetSecretValue
+              Resource: !Ref AuroraSecretArn
+      Tags:
+        Service: auto-approve-scheduler
+      Events:
+        ScheduleRule:
+          Type: Schedule
+          Properties:
+            Schedule: rate(1 minute)
+            Description: Auto-approve registrations for "Teste 123" every minute
+            Enabled: true
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - auto-approve-scheduler.ts
+
+  # ---------------------------------------------------------------------------
+  # Real-Time Critical Error Notification
+  # Flow: SimulateCriticalError Lambda logs "CRITICAL" →
+  #       CloudWatch Logs Subscription Filter catches it →
+  #       LogAlarmNotifier Lambda publishes to SNS → instant email
+  # This demonstrates near real-time alerting (~2-5 seconds) vs CloudWatch
+  # Alarms which have 1-5 minute evaluation periods.
+  # ---------------------------------------------------------------------------
+  RealTimeAlertTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub "${StackName}-RealTimeAlerts"
+      Tags:
+        - Key: Project
+          Value: EventHub
+
+  RealTimeAlertSubscription:
+    Type: AWS::SNS::Subscription
+    Properties:
+      Protocol: email
+      Endpoint: !Ref AdminEmail
+      TopicArn: !Ref RealTimeAlertTopic
+
+  SimulateCriticalErrorFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: simulate-critical-error.handler
+      CodeUri: ../src/handlers/
+      Description: Simular erro crítico para demonstração de alerta em tempo real
+      Layers:
+        - !Ref PowertoolsLayer
+      Tags:
+        Service: simulate-critical-error
+      Events:
+        SimulateCriticalError:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref EventHubApi
+            Path: /admin/simulate-critical-error
+            Method: POST
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - simulate-critical-error.ts
+
+  LogAlarmNotifierFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: log-alarm-notifier.handler
+      CodeUri: ../src/handlers/
+      Description: Recebe logs via Subscription Filter e publica alerta no SNS em tempo real
+      Layers:
+        - !Ref PowertoolsLayer
+      Environment:
+        Variables:
+          ALARM_TOPIC_ARN: !Ref RealTimeAlertTopic
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action:
+                - sns:Publish
+              Resource: !Ref RealTimeAlertTopic
+      Tags:
+        Service: log-alarm-notifier
+    Metadata:
+      BuildMethod: esbuild
+      BuildProperties:
+        Minify: true
+        Target: es2022
+        Sourcemap: true
+        EntryPoints:
+          - log-alarm-notifier.ts
+        External:
+          - "@aws-sdk/client-sns"
+
+  # Permission for CloudWatch Logs to invoke the notifier Lambda
+  LogAlarmNotifierInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref LogAlarmNotifierFunction
+      Action: lambda:InvokeFunction
+      Principal: logs.amazonaws.com
+      SourceArn: !Sub "arn:aws:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/lambda/*"
+
+  # Log group for SimulateCriticalError — must exist before the subscription filter
+  SimulateCriticalErrorLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${SimulateCriticalErrorFunction}"
+      RetentionInDays: 7
+
+  # Subscription Filter on the SimulateCriticalError log group
+  # Triggers the notifier when "CRITICAL" appears in the logs
+  CriticalErrorSubscriptionFilter:
+    Type: AWS::Logs::SubscriptionFilter
+    DependsOn:
+      - LogAlarmNotifierInvokePermission
+      - SimulateCriticalErrorLogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/lambda/${SimulateCriticalErrorFunction}"
+      FilterPattern: "CRITICAL"
+      DestinationArn: !GetAtt LogAlarmNotifierFunction.Arn
+
+Outputs:
+  ApiUrl:
+    Value: !Sub "https://${EventHubApi}.execute-api.${AWS::Region}.amazonaws.com"
+  ApiId:
+    Value: !Ref EventHubApi
+  ProcessUploadedDocumentFunctionArn:
+    Value: !GetAtt ProcessUploadedDocumentFunction.Arn
+  ProcessUploadedDocumentFunctionName:
+    Value: !Ref ProcessUploadedDocumentFunction
+  ProcessDocumentDLQName:
+    Value: !GetAtt ProcessDocumentDLQ.QueueName

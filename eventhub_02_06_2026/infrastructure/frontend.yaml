@@ -1,0 +1,155 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  EventHub — Frontend: S3 Static Hosting, CloudFront Distribution, OAC
+
+# =============================================================================
+# This stack serves the static frontend (HTML/JS/CSS):
+# - S3 bucket holds the files (no public access — private by default)
+# - CloudFront CDN sits in front, serving content over HTTPS globally
+# - Origin Access Control (OAC) is the modern way to let CloudFront read
+#   from a private S3 bucket (replaces the deprecated OAI approach)
+# - Custom error responses map 403/404 → index.html for SPA client-side routing
+# =============================================================================
+
+Parameters:
+  StackName:
+    Type: String
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # S3 — Frontend Bucket
+  # Private bucket storing index.html, app.js, admin.html.
+  # All public access is blocked — CloudFront is the only way to read files.
+  # ---------------------------------------------------------------------------
+  FrontendBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "${StackName}-frontend-${AWS::AccountId}"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      Tags:
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  # ---------------------------------------------------------------------------
+  # CloudFront — Origin Access Control (OAC)
+  # Modern replacement for OAI. Uses SigV4 signing so CloudFront can
+  # authenticate to S3 without making the bucket public.
+  # The bucket policy below grants access only when the request comes
+  # from this specific CloudFront distribution.
+  # ---------------------------------------------------------------------------
+  FrontendOAC:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "${StackName}-frontend-oac"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ---------------------------------------------------------------------------
+  # S3 Bucket Policy — CloudFront OAC Access
+  # Allows only the cloudfront.amazonaws.com service to GetObject,
+  # conditioned on the request coming from our specific distribution ARN.
+  # Note: DependsOn FrontendDistribution to avoid circular reference issues.
+  # ---------------------------------------------------------------------------
+  FrontendBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    DependsOn: FrontendDistribution
+    Properties:
+      Bucket: !Ref FrontendBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontServicePrincipal
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${FrontendBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/${FrontendDistribution}"
+
+  # ---------------------------------------------------------------------------
+  # CloudFront Function — URL Rewrite
+  # Appends index.html to directory paths (e.g. /admin/ → /admin/index.html).
+  # DefaultRootObject only handles the root path (/), not subdirectories.
+  # This function runs at the edge on every viewer request (near-zero latency).
+  # ---------------------------------------------------------------------------
+  UrlRewriteFunction:
+    Type: AWS::CloudFront::Function
+    Properties:
+      Name: !Sub "${StackName}-url-rewrite"
+      AutoPublish: true
+      FunctionCode: |
+        function handler(event) {
+          var request = event.request;
+          var uri = request.uri;
+          if (uri.endsWith('/')) {
+            request.uri += 'index.html';
+          } else if (!uri.includes('.')) {
+            request.uri += '/index.html';
+          }
+          return request;
+        }
+      FunctionConfig:
+        Comment: Rewrite directory paths to index.html
+        Runtime: cloudfront-js-2.0
+
+  # ---------------------------------------------------------------------------
+  # CloudFront — Distribution
+  # Global CDN edge network. Caches content close to users.
+  # - HTTPS only (redirects HTTP)
+  # - Default root object: index.html
+  # - 403/404 → index.html with 200 (enables client-side SPA routing)
+  # - S3OriginConfig.OriginAccessIdentity = "" is required when using OAC
+  # - FunctionAssociations: runs UrlRewriteFunction on viewer-request to
+  #   resolve /admin/ → /admin/index.html
+  # ---------------------------------------------------------------------------
+  FrontendDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        Origins:
+          - Id: S3Origin
+            DomainName: !GetAtt FrontendBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt FrontendOAC.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: S3Origin
+          ViewerProtocolPolicy: redirect-to-https
+          AllowedMethods: [GET, HEAD]
+          CachedMethods: [GET, HEAD]
+          ForwardedValues:
+            QueryString: false
+          FunctionAssociations:
+            - EventType: viewer-request
+              FunctionARN: !GetAtt UrlRewriteFunction.FunctionARN
+        CustomErrorResponses:
+          - ErrorCode: 404
+            ResponseCode: 404
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 10
+      Tags:
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+Outputs:
+  FrontendUrl:
+    Value: !Sub "https://${FrontendDistribution.DomainName}"
+  FrontendBucketName:
+    Value: !Ref FrontendBucket
+  FrontendDistributionId:
+    Value: !Ref FrontendDistribution

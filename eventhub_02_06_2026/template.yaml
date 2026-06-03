@@ -1,0 +1,146 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: >
+  EventHub Serverless - Plataforma de gestão de eventos e inscrições
+  construída com serviços AWS serverless (nested stacks).
+
+# =============================================================================
+# Parameters
+# =============================================================================
+Parameters:
+  AdminEmail:
+    Type: String
+    Description: E-mail do administrador para notificações via SNS
+  NATInstanceAMI:
+    Type: AWS::EC2::Image::Id
+    Default: ami-086c08b98cb348e57
+    Description: AMI ID do fck-nat para a região de deploy (us-east-1). Consultar https://fck-nat.dev para outras regiões.
+
+# =============================================================================
+# Resources — Nested Stacks
+# =============================================================================
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # 1. Networking — VPC, Subnets, NAT Instance
+  # ---------------------------------------------------------------------------
+  NetworkingStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: infrastructure/networking.yaml
+      Parameters:
+        StackName: !Ref AWS::StackName
+        NATInstanceAMI: !Ref NATInstanceAMI
+      Tags:
+        - Key: Project
+          Value: EventHub
+        - Key: Layer
+          Value: Networking
+
+  # ---------------------------------------------------------------------------
+  # 2. Database — DynamoDB, Aurora, Security Groups
+  # ---------------------------------------------------------------------------
+  DatabaseStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: infrastructure/database.yaml
+      Parameters:
+        StackName: !Ref AWS::StackName
+        VpcId: !GetAtt NetworkingStack.Outputs.VpcId
+        PrivateSubnet1Id: !GetAtt NetworkingStack.Outputs.PrivateSubnet1Id
+        PrivateSubnet2Id: !GetAtt NetworkingStack.Outputs.PrivateSubnet2Id
+        NATInstanceSecurityGroupId: !GetAtt NetworkingStack.Outputs.NATInstanceSecurityGroupId
+      Tags:
+        - Key: Project
+          Value: EventHub
+        - Key: Layer
+          Value: Database
+
+  # ---------------------------------------------------------------------------
+  # 3. API — API Gateway, Lambda Functions
+  # ---------------------------------------------------------------------------
+  ApiStack:
+    Type: AWS::Serverless::Application
+    Properties:
+      Location: infrastructure/api.yaml
+      Parameters:
+        StackName: !Ref AWS::StackName
+        EventsCatalogTableName: !GetAtt DatabaseStack.Outputs.EventsCatalogTableName
+        EventsCatalogTableArn: !GetAtt DatabaseStack.Outputs.EventsCatalogTableArn
+        LambdaSecurityGroupId: !GetAtt DatabaseStack.Outputs.LambdaSecurityGroupId
+        PrivateSubnet1Id: !GetAtt NetworkingStack.Outputs.PrivateSubnet1Id
+        PrivateSubnet2Id: !GetAtt NetworkingStack.Outputs.PrivateSubnet2Id
+        AuroraClusterEndpoint: !GetAtt DatabaseStack.Outputs.AuroraClusterEndpoint
+        AuroraClusterPort: !GetAtt DatabaseStack.Outputs.AuroraClusterPort
+        AuroraSecretArn: !GetAtt DatabaseStack.Outputs.AuroraSecretArn
+        AdminEmail: !Ref AdminEmail
+      Tags:
+        Project: EventHub
+        Layer: API
+
+  # ---------------------------------------------------------------------------
+  # 4. Observability — SNS, CloudWatch Alarms
+  # ---------------------------------------------------------------------------
+  ObservabilityStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: infrastructure/observability.yaml
+      Parameters:
+        StackName: !Ref AWS::StackName
+        AdminEmail: !Ref AdminEmail
+        ApiId: !GetAtt ApiStack.Outputs.ApiId
+        ProcessUploadedDocumentFunctionName: !GetAtt ApiStack.Outputs.ProcessUploadedDocumentFunctionName
+        ProcessDocumentDLQName: !GetAtt ApiStack.Outputs.ProcessDocumentDLQName
+      Tags:
+        - Key: Project
+          Value: EventHub
+        - Key: Layer
+          Value: Observability
+
+  # ---------------------------------------------------------------------------
+  # 5. Storage — S3 Documents Bucket
+  # ---------------------------------------------------------------------------
+  StorageStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: infrastructure/storage.yaml
+      Parameters:
+        StackName: !Ref AWS::StackName
+        ProcessUploadedDocumentFunctionArn: !GetAtt ApiStack.Outputs.ProcessUploadedDocumentFunctionArn
+      Tags:
+        - Key: Project
+          Value: EventHub
+        - Key: Layer
+          Value: Storage
+
+  # ---------------------------------------------------------------------------
+  # 6. Frontend — S3, CloudFront
+  # ---------------------------------------------------------------------------
+  FrontendStack:
+    Type: AWS::CloudFormation::Stack
+    Properties:
+      TemplateURL: infrastructure/frontend.yaml
+      Parameters:
+        StackName: !Ref AWS::StackName
+      Tags:
+        - Key: Project
+          Value: EventHub
+        - Key: Layer
+          Value: Frontend
+
+# =============================================================================
+# Outputs
+# =============================================================================
+Outputs:
+  FrontendUrl:
+    Description: URL do frontend via CloudFront
+    Value: !GetAtt FrontendStack.Outputs.FrontendUrl
+  FrontendBucketName:
+    Description: Nome do bucket S3 para deploy do frontend
+    Value: !GetAtt FrontendStack.Outputs.FrontendBucketName
+  FrontendDistributionId:
+    Description: ID da distribuição CloudFront
+    Value: !GetAtt FrontendStack.Outputs.FrontendDistributionId
+  ApiUrl:
+    Description: URL do API Gateway HTTP API
+    Value: !GetAtt ApiStack.Outputs.ApiUrl

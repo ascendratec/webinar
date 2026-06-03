@@ -1,0 +1,330 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  EventHub — Networking: VPC, Subnets, Route Tables, NAT Instance
+
+# =============================================================================
+# This stack creates the entire network foundation:
+# - A VPC with /16 CIDR (65k IPs)
+# - 2 public subnets (for NAT instance, internet-facing resources)
+# - 2 private subnets (for Aurora, Lambda functions that need DB access)
+# - A fck-nat instance (cheap NAT Gateway alternative) for private subnet
+#   internet egress (Lambda needs this to call AWS APIs like Secrets Manager)
+# - Route tables wiring public → IGW and private → NAT
+# =============================================================================
+
+Parameters:
+  StackName:
+    Type: String
+  NATInstanceAMI:
+    Type: AWS::EC2::Image::Id
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # VPC (Virtual Private Cloud)
+  # Isolated network for all EventHub resources. CIDR 10.0.0.0/16 gives us
+  # room for multiple /24 subnets. DNS support enabled so services can resolve
+  # each other by hostname (required for Aurora endpoint resolution).
+  # ---------------------------------------------------------------------------
+  EventHubVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackName}-VPC"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  # ---------------------------------------------------------------------------
+  # Internet Gateway
+  # Attaches to the VPC and provides a route to the public internet.
+  # Without this, nothing in the VPC can reach external services.
+  # ---------------------------------------------------------------------------
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackName}-IGW"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  InternetGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      InternetGatewayId: !Ref InternetGateway
+      VpcId: !Ref EventHubVPC
+
+  # ---------------------------------------------------------------------------
+  # Public Subnets
+  # Two subnets in different AZs for high availability. Public because they
+  # have a route to the Internet Gateway. The NAT instance lives here.
+  # MapPublicIpOnLaunch ensures EC2 instances get public IPs automatically.
+  # ---------------------------------------------------------------------------
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref EventHubVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackName}-PublicSubnet1"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref EventHubVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackName}-PublicSubnet2"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  # ---------------------------------------------------------------------------
+  # Private Subnets
+  # Two subnets in different AZs (required by Aurora). No direct internet
+  # access — traffic goes through the NAT instance. Lambda functions that
+  # need Aurora access are placed here.
+  # ---------------------------------------------------------------------------
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref EventHubVPC
+      CidrBlock: 10.0.3.0/24
+      AvailabilityZone: !Select [0, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackName}-PrivateSubnet1"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref EventHubVPC
+      CidrBlock: 10.0.4.0/24
+      AvailabilityZone: !Select [1, !GetAZs ""]
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackName}-PrivateSubnet2"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  # ---------------------------------------------------------------------------
+  # Public Route Table
+  # Associates public subnets with a route to the Internet Gateway.
+  # Any resource in a public subnet can send/receive internet traffic.
+  # ---------------------------------------------------------------------------
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref EventHubVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackName}-PublicRT"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: InternetGatewayAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # ---------------------------------------------------------------------------
+  # NAT Instance (fck-nat)
+  # A lightweight, open-source NAT instance (https://fck-nat.dev).
+  # Much cheaper than AWS NAT Gateway (~$3/mo vs ~$32/mo) for workshop use.
+  # Sits in the public subnet, receives traffic from private subnets, and
+  # forwards it to the internet. SourceDestCheck=false is required so EC2
+  # allows traffic that isn't destined for this instance's own IP.
+  # The Elastic IP gives it a stable public address.
+  # ---------------------------------------------------------------------------
+  NATInstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for NAT Instance - allows outbound traffic
+      VpcId: !Ref EventHubVPC
+      SecurityGroupEgress:
+        - IpProtocol: "-1"
+          CidrIp: 0.0.0.0/0
+      SecurityGroupIngress:
+        - IpProtocol: "-1"
+          CidrIp: 10.0.0.0/16
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackName}-NATInstance-SG"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  NATInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: t3.micro
+      ImageId: !Ref NATInstanceAMI
+      SubnetId: !Ref PublicSubnet1
+      SecurityGroupIds:
+        - !Ref NATInstanceSecurityGroup
+      SourceDestCheck: false
+      IamInstanceProfile: !Ref NATInstanceProfile
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackName}-NATInstance"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  # IAM Role for NAT Instance — enables SSM Session Manager access
+  # without opening any inbound ports (SSH not needed).
+  NATInstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+      Tags:
+        - Key: Project
+          Value: EventHub
+
+  NATInstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref NATInstanceRole
+
+  NATInstanceEIP:
+    Type: AWS::EC2::EIP
+    Properties:
+      Domain: vpc
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackName}-NATInstance-EIP"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  NATInstanceEIPAssociation:
+    Type: AWS::EC2::EIPAssociation
+    Properties:
+      InstanceId: !Ref NATInstance
+      AllocationId: !GetAtt NATInstanceEIP.AllocationId
+
+  # ---------------------------------------------------------------------------
+  # Private Route Tables
+  # Each private subnet gets its own route table pointing 0.0.0.0/0
+  # to the NAT instance. This gives Lambda and Aurora outbound internet
+  # access (for AWS API calls) without exposing them directly.
+  # ---------------------------------------------------------------------------
+  PrivateRouteTable1:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref EventHubVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackName}-PrivateRT1"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  PrivateRoute1:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable1
+      DestinationCidrBlock: 0.0.0.0/0
+      InstanceId: !Ref NATInstance
+
+  PrivateSubnet1RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet1
+      RouteTableId: !Ref PrivateRouteTable1
+
+  PrivateRouteTable2:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref EventHubVPC
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackName}-PrivateRT2"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  PrivateRoute2:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref PrivateRouteTable2
+      DestinationCidrBlock: 0.0.0.0/0
+      InstanceId: !Ref NATInstance
+
+  PrivateSubnet2RouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet2
+      RouteTableId: !Ref PrivateRouteTable2
+
+Outputs:
+  VpcId:
+    Value: !Ref EventHubVPC
+  PublicSubnet1Id:
+    Value: !Ref PublicSubnet1
+  PublicSubnet2Id:
+    Value: !Ref PublicSubnet2
+  PrivateSubnet1Id:
+    Value: !Ref PrivateSubnet1
+  PrivateSubnet2Id:
+    Value: !Ref PrivateSubnet2
+  NATInstanceId:
+    Value: !Ref NATInstance
+  NATInstanceSecurityGroupId:
+    Value: !Ref NATInstanceSecurityGroup

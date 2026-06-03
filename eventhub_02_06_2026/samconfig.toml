@@ -1,0 +1,20 @@
+# Configurações de deploy do AWS SAM
+# Mais informações: https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/serverless-sam-cli-config.html
+
+version = 0.1
+
+[default.deploy.parameters]
+stack_name = "eventhub-webinar"
+resolve_s3 = true
+s3_prefix = "eventhub-webinar"
+region = "us-east-1"
+confirm_changeset = true
+capabilities = "CAPABILITY_IAM CAPABILITY_AUTO_EXPAND"
+parameter_overrides = "AdminEmail=\"lucas.martins@ascendra.com.br\" NATInstanceAMI=\"ami-086c08b98cb348e57\""
+tags = "Project=\"EventHub\" Environment=\"Workshop\""
+
+[default.build.parameters]
+use_container = false
+
+[default.validate.parameters]
+lint = true

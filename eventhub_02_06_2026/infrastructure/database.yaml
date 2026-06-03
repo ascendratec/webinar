@@ -1,0 +1,186 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  EventHub — Database: DynamoDB, Aurora Serverless v2, Security Groups
+
+# =============================================================================
+# This stack provisions the data layer:
+# - DynamoDB table for the events catalog (fast key-value lookups)
+# - Aurora Serverless v2 PostgreSQL for registrations (relational, ACID)
+# - Security groups controlling network access between Lambda and Aurora
+#
+# Polyglot persistence rationale:
+# - Events = simple reads/writes + atomic counter → DynamoDB
+# - Registrations = foreign keys, transactions, complex queries → PostgreSQL
+# =============================================================================
+
+Parameters:
+  StackName:
+    Type: String
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  PrivateSubnet1Id:
+    Type: AWS::EC2::Subnet::Id
+  PrivateSubnet2Id:
+    Type: AWS::EC2::Subnet::Id
+  NATInstanceSecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security group of the NAT instance (for SSM tunnel access to Aurora)
+
+Resources:
+
+  # ---------------------------------------------------------------------------
+  # DynamoDB — Catálogo de Eventos
+  # Single-table design with pk = eventId (UUID).
+  # PAY_PER_REQUEST = no capacity planning, scales to zero cost when idle.
+  # PITR = point-in-time recovery (continuous backups for 35 days).
+  # SSE = server-side encryption at rest.
+  # ---------------------------------------------------------------------------
+  EventsCatalogTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub "${StackName}-EventsCatalog"
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: pk
+          AttributeType: S
+      KeySchema:
+        - AttributeName: pk
+          KeyType: HASH
+      PointInTimeRecoverySpecification:
+        PointInTimeRecoveryEnabled: true
+      SSESpecification:
+        SSEEnabled: true
+
+  # ---------------------------------------------------------------------------
+  # Security Groups — Lambda ↔ Aurora network rules
+  # Lambda SG: allows outbound to Aurora (5432) and HTTPS (443) for AWS APIs.
+  # Aurora SG: allows inbound only from Lambda SG on port 5432.
+  # This ensures Aurora is unreachable from anywhere except our Lambda functions.
+  # ---------------------------------------------------------------------------
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for Lambda functions - allows outbound to Aurora on port 5432
+      VpcId: !Ref VpcId
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackName}-Lambda-SG"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  AuroraSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security Group for Aurora cluster - allows inbound from Lambda on port 5432
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref NATInstanceSecurityGroupId
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackName}-Aurora-SG"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  LambdaSecurityGroupEgressToAurora:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 5432
+      ToPort: 5432
+      DestinationSecurityGroupId: !Ref AuroraSecurityGroup
+
+  LambdaSecurityGroupEgressHttps:
+    Type: AWS::EC2::SecurityGroupEgress
+    Properties:
+      GroupId: !Ref LambdaSecurityGroup
+      IpProtocol: tcp
+      FromPort: 443
+      ToPort: 443
+      CidrIp: 0.0.0.0/0
+
+  # ---------------------------------------------------------------------------
+  # Aurora Serverless v2 — PostgreSQL 16.4
+  # Serverless v2 scales capacity (ACU) automatically: 0.5 min → 2 max.
+  # ManageMasterUserPassword: Secrets Manager creates and auto-rotates the
+  # master password — no hardcoded credentials anywhere.
+  # EnableHttpEndpoint: allows Data API access (useful for debugging).
+  # StorageEncrypted: data encrypted at rest with AWS-managed key.
+  # Placed in private subnets via DBSubnetGroup.
+  # ---------------------------------------------------------------------------
+  DBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for Aurora Serverless v2 cluster (private subnets)
+      SubnetIds:
+        - !Ref PrivateSubnet1Id
+        - !Ref PrivateSubnet2Id
+      Tags:
+        - Key: Name
+          Value: !Sub "${StackName}-DBSubnetGroup"
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      Engine: aurora-postgresql
+      EngineVersion: "16.4"
+      DBClusterIdentifier: !Sub "${StackName}-aurora-cluster"
+      MasterUsername: eventhubadmin
+      ManageMasterUserPassword: true
+      EnableHttpEndpoint: true
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: 0.5
+        MaxCapacity: 2
+      StorageEncrypted: true
+      DBSubnetGroupName: !Ref DBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref AuroraSecurityGroup
+      Tags:
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+  AuroraInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceIdentifier: !Sub "${StackName}-aurora-instance-1"
+      Tags:
+        - Key: Project
+          Value: EventHub
+        - Key: Environment
+          Value: Workshop
+
+Outputs:
+  EventsCatalogTableName:
+    Value: !Ref EventsCatalogTable
+  EventsCatalogTableArn:
+    Value: !GetAtt EventsCatalogTable.Arn
+  LambdaSecurityGroupId:
+    Value: !Ref LambdaSecurityGroup
+  AuroraClusterEndpoint:
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+  AuroraClusterPort:
+    Value: !GetAtt AuroraCluster.Endpoint.Port
+  AuroraSecretArn:
+    Value: !GetAtt AuroraCluster.MasterUserSecret.SecretArn
