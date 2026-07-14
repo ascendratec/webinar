@@ -354,9 +354,9 @@ document.addEventListener('alpine:init', () => {
         window.history.replaceState({}, '', url.toString());
       } catch (err) {
         if (err.status === 404) {
-          this.statusError = 'Registration not found';
+          this.statusError = 'Inscrição não encontrada';
         } else {
-          this.statusError = err.message || 'Failed to check status';
+          this.statusError = err.message || 'Falha ao consultar status';
         }
       } finally {
         this.statusLoading = false;
@@ -425,10 +425,10 @@ document.addEventListener('alpine:init', () => {
         this.selectedRegistration = data;
       } catch (err) {
         if (err.status === 404) {
-          this.error = 'Registration not found';
-          this.$store.notification.show('Registration not found', 'error');
+          this.error = 'Inscrição não encontrada';
+          this.$store.notification.show('Inscrição não encontrada', 'error');
         } else {
-          this.$store.notification.show(err.message || 'Failed to load registration details', 'error');
+          this.$store.notification.show(err.message || 'Falha ao carregar detalhes da inscrição', 'error');
         }
       } finally {
         this.detailLoading = false;

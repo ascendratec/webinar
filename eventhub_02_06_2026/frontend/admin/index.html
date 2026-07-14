@@ -157,12 +157,12 @@
 
       <p x-show="loading" aria-busy="true">Carregando inscrições...</p>
 
-      <div x-show="error === 'Registration not found'" role="alert">
+      <div x-show="error === 'Inscrição não encontrada'" role="alert">
         <p style="color: #721c24;">Inscrição não encontrada.</p>
         <button @click="backToList(); error = null;">Voltar à lista</button>
       </div>
 
-      <div x-show="error && error !== 'Registration not found'" role="alert">
+      <div x-show="error && error !== 'Inscrição não encontrada'" role="alert">
         <p x-text="error" style="color: #721c24;"></p>
         <button @click="fetchRegistrations()">Tentar novamente</button>
       </div>
